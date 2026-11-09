@@ -152,6 +152,32 @@ def write_chroms(grp: h5py.Group, chroms: pd.DataFrame, h5opts: dict) -> None:
         put(grp, chroms[columns])
 
 
+# HDF5 keeps an enum's member names and values in the object header of the
+# dataset that uses it, and rejects the enum when they don't fit there (around
+# 64 KiB, depending on the HDF5 version and file format). Building the enum
+# type takes time quadratic in its number of members, since each insertion is
+# checked against the members already inserted: 38 s for a draft assembly of
+# 128k contigs, to build an enum that is then rejected.
+# An enum whose members need more than this many bytes, counting only each
+# name, a null terminator and the value, is never built. Below it, an enum that
+# doesn't fit is still rejected by HDF5 and stored as raw integers.
+_MAX_CHROM_ENUM_BYTES = 2**17
+
+
+def _chrom_enum_may_fit(chromnames: Any) -> bool:
+    """
+    Whether an HDF5 enum of the chromosome names might fit in a dataset's
+    object header. If not, building the enum type would only waste time.
+    """
+    n_chroms = len(chromnames)
+    # Every name has at least one character
+    per_member = np.dtype(CHROMID_DTYPE).itemsize + 1
+    if n_chroms * (per_member + 1) > _MAX_CHROM_ENUM_BYTES:
+        return False
+    n_bytes = n_chroms * per_member + sum(len(name) for name in chromnames)
+    return n_bytes <= _MAX_CHROM_ENUM_BYTES
+
+
 def write_bins(
     grp: h5py.Group,
     bins: pd.DataFrame,
@@ -177,9 +203,7 @@ def write_bins(
         HDF5 dataset filter options.
 
     """
-    n_chroms = len(chromnames)
     n_bins = len(bins)
-    idmap = dict(zip(chromnames, range(n_chroms)))
 
     # Convert chrom names to enum, factorizing so names are looked up once
     codes, names = pd.factorize(bins["chrom"])
@@ -190,7 +214,10 @@ def write_bins(
         missing = list(pd.Index(names)[ids < 0])
         raise ValueError(f"Chromosomes not in the chrom table: {missing}")
     chrom_ids = ids.astype(CHROMID_DTYPE)[codes]
+    if chrom_as_enum and not _chrom_enum_may_fit(chromnames):
+        chrom_as_enum = False
     if chrom_as_enum:
+        idmap = dict(zip(chromnames, range(len(chromnames))))
         chrom_dtype = h5py.special_dtype(enum=(CHROMID_DTYPE, idmap))
     else:
         chrom_dtype = CHROMID_DTYPE

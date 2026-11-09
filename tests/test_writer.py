@@ -9,7 +9,7 @@ import pytest
 
 import cooler
 from cooler.create import BadInputError
-from cooler.create._writer import _CoolerWriter, write_bins
+from cooler.create._writer import _chrom_enum_may_fit, _CoolerWriter, write_bins
 
 BINS = cooler.util.binnify(pd.Series({"chr1": 60, "chr2": 40}), 10)  # 10 bins
 
@@ -62,6 +62,59 @@ def test_bin_table_chrom_ids(tmp_path):
         bins = bins.dropna()
         with pytest.raises(ValueError, match=r"not in the chrom table: \['chr2'\]"):
             write_bins(f.create_group("b"), bins, ["chr1"], {})
+
+
+def test_chrom_enum_not_built_for_many_chromosomes(tmp_path, monkeypatch):
+    # An enum of this many chromosome names can't fit in an HDF5 object header,
+    # and building it takes time quadratic in its size, so it isn't attempted
+    n = 20_000
+    names = [f"scaffold_{i:05}" for i in range(n)]
+    bins = pd.DataFrame({"chrom": names, "start": 0, "end": 10})
+    built = []
+    special_dtype = h5py.special_dtype
+
+    def spy(**kwargs):
+        built.append(kwargs)
+        return special_dtype(**kwargs)
+
+    monkeypatch.setattr(h5py, "special_dtype", spy)
+    path = str(tmp_path / "t.cool")
+    with _CoolerWriter(path, bins) as w:
+        w.write({"bin1_id": [0, n - 1], "bin2_id": [1, n - 1], "count": [1, 2]})
+    assert not [kw for kw in built if "enum" in kw]
+    with h5py.File(path, "r") as f:
+        assert h5py.check_enum_dtype(f["bins/chrom"].dtype) is None
+        assert f["bins/chrom"].dtype == np.int32
+        assert f["bins/chrom"].attrs["enum_path"] == "/chroms/name"
+    clr = cooler.Cooler(path)
+    assert list(clr.bins()[-2:]["chrom"]) == names[-2:]
+
+
+def test_chrom_enum_kept_for_few_chromosomes(tmp_path):
+    with h5py.File(tmp_path / "t.h5", "w") as f:
+        write_bins(f.create_group("bins"), BINS, ["chr1", "chr2"], {})
+        assert h5py.check_enum_dtype(f["bins/chrom"].dtype) == {"chr1": 0, "chr2": 1}
+        assert "enum_path" not in f["bins/chrom"].attrs
+
+
+@pytest.mark.parametrize("name_length", [8, 40])
+def test_chrom_enum_skipped_only_when_hdf5_rejects_it(tmp_path, name_length):
+    # The smallest enum that isn't built is one HDF5 would reject anyway, so
+    # skipping it doesn't change the file
+    lo, hi = 1, 2**17  # find the first number of names whose enum isn't built
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        names = [f"{i:0{name_length}}" for i in range(mid)]
+        lo, hi = (mid, hi) if _chrom_enum_may_fit(names) else (lo, mid)
+    names = [f"{i:0{name_length}}" for i in range(hi)]
+    assert not _chrom_enum_may_fit(names)
+    dtype = h5py.special_dtype(enum=(np.int32, dict(zip(names, range(hi)))))
+    too_large = "object header message is too large"
+    with (
+        h5py.File(tmp_path / "t.h5", "w") as f,
+        pytest.raises(ValueError, match=too_large),
+    ):
+        f.create_dataset("chrom", shape=(1,), dtype=dtype)
 
 
 def test_chunks_match_single_write(tmp_path):

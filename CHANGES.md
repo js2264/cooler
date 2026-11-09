@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Performance
+* Writing a cooler with many chromosomes or contigs no longer builds an HDF5 enum for the bin table's `chrom` column when the enum can't fit in the dataset's header. HDF5 rejects such an enum, so the column was stored as integers anyway, but building it took time quadratic in the number of chromosomes, each time the bin table was written, which `cooler cload pairs` and `create_cooler(..., ordered=False)` do once per chunk. For a draft assembly of 128,000 contigs, that was 38 s per chunk; creating a cooler of 40,000 contigs from 5 chunks takes 1.2 s instead of 21 s. The files are unchanged.
+
 ### Bug fixes
 * fix: When worker processes fail to start, parallel commands and functions raise `cooler.parallel.WorkerStartError`, a subclass of `WorkerDiedError`, saying so, instead of suggesting that a worker ran out of memory. With the `spawn` or `forkserver` start method (macOS, and Linux from Python 3.14), the most common cause is a script that starts them outside `if __name__ == "__main__":`, which the message points out. The CLI no longer suggests fewer processes or smaller chunks in this case.
 
